@@ -733,6 +733,7 @@ class AccountOperations:
         try:
             self._last_register_password_error = None
             self._log(f"生成密码: {password}")
+            # self._log(f"sen_token: {sen_token}")
 
             register_body = json.dumps({
                 "password": password,
@@ -749,6 +750,7 @@ class AccountOperations:
                 data=register_body,
             )
 
+            self._log(f"提交密码状态: \nData {register_body}\nheaders: {json.dumps(self.session.cookies.get_dict())}\n")
             self._log(f"提交密码状态: {response.status_code}")
 
             if response.status_code != 200:
@@ -781,7 +783,7 @@ class AccountOperations:
             return True, password
 
         except Exception as e:
-            self._log(f"密码注册失败: {e}", "error")
+            self._log(f"密码注册失败ex: {e}", "error")
             self._last_register_password_error = str(e)
             return False, None
     
@@ -1508,6 +1510,87 @@ class RegistrationEngine:
             result.error_message = str(e)
             return result
 
+    def run_login(self, email: str, password: str) -> RegistrationResult:
+        """按本地账号密码执行登录并获取 OAuth Token。"""
+        result = RegistrationResult(success=False, logs=self.logs)
+        normalized_email = str(email or "").strip().lower()
+        normalized_password = str(password or "").strip()
+
+        try:
+            self._log("=" * 60)
+            self._log("本地账号登录流程启动")
+            self._log("=" * 60)
+
+            if not normalized_email or not normalized_password:
+                result.error_message = "邮箱或密码为空"
+                return result
+
+            self._is_existing_account = True
+            self.email = normalized_email
+            self.password = normalized_password
+            self.email_ops.email = normalized_email
+            self.email_ops.inbox_email = normalized_email
+            self.email_ops.email_info = {
+                "email": normalized_email,
+                "service_id": normalized_email,
+                "id": normalized_email,
+            }
+            result.email = normalized_email
+            result.password = normalized_password
+            result.source = "login"
+
+            self._log("1、IP 检查")
+            ip_ok, location = self.auth_ops.check_ip_location()
+            if not ip_ok:
+                result.error_message = f"IP 地理位置不支持: {location}"
+                self._log(f"IP 检查失败: {location}", "error")
+                return result
+            self._log(f"IP 位置: {location}")
+
+            self._log("2、从本地文件中获取邮箱账号和密码")
+            self._log(f"登录邮箱: {normalized_email}")
+
+            self._log("3、OAuth 初始化")
+            self._log("4、Sentinel 校验")
+            did, sen_token = self._prepare_authorize_flow("登录授权")
+            if not did:
+                result.error_message = "获取 Device ID 失败"
+                return result
+            result.device_id = did
+            if not sen_token:
+                result.error_message = "Sentinel POW 验证失败"
+                return result
+
+            self._log("5、自动填写邮箱和密码登录")
+            login_start_result = self.login_ops.submit_login_start(normalized_email, did, sen_token)
+            if not login_start_result.success:
+                result.error_message = f"提交登录邮箱失败: {login_start_result.error_message}"
+                return result
+
+            page_type = str(login_start_result.page_type or "").strip()
+            if page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+                password_result = self.login_ops.submit_login_password(normalized_password)
+                if not password_result.success:
+                    result.error_message = f"提交登录密码失败: {password_result.error_message}"
+                    return result
+                if not password_result.is_existing_account:
+                    result.error_message = f"提交密码后未进入验证码页面: {password_result.page_type or 'unknown'}"
+                    return result
+            elif page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                self._log("登录入口已直接进入 OTP 验证页面")
+            else:
+                result.error_message = f"登录入口返回未知页面类型: {page_type or 'unknown'}"
+                return result
+
+            self._log("6、自动从 CloudMail 中获取验证码完成 OTP 验证")
+            self._log("7、workspace 选择、OAuth 回调和 token 获取")
+            return self._complete_registration(result)
+
+        except Exception as e:
+            self._log(f"登录过程中发生未预期错误: {e}", "error")
+            result.error_message = str(e)
+            return result
+
 
     def _handle_new_account_registration(self, result: RegistrationResult, did: str, sen_token: Optional[str]) -> RegistrationResult:
         """处理新账号注册流程"""
@@ -1749,6 +1832,11 @@ class RegistrationEngine:
         callback_url, _final_url = self.redirect_ops.follow_redirects(continue_url)
         
         if not callback_url:
+            if _is_registration_gate_url(_final_url):
+                result.error_message = "登录后跳转到添加手机号/完善资料页面，无法继续获取 Token"
+                self._log(f"{result.error_message}: {_final_url}", "error")
+                return result
+
             self._log("未命中 OAuth 回调，尝试 auth/session 兜底抓取 token...", "warning")
             self.token_ops.capture_auth_session_tokens(result, access_hint=result.access_token)
             if not result.account_id:
@@ -1836,4 +1924,3 @@ class RegistrationEngine:
             "has_access_token": bool(result.access_token),
             "has_refresh_token": bool(result.refresh_token),
         }
-

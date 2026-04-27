@@ -6,7 +6,9 @@
     "cloudmail_url": "",
     "timeout": 30,
     "proxy": "http://127.0.0.1:10808",
+    "input_file": "accounts.txt",
     "output_file": "registered_accounts.txt",
+    "failed_output_file": "failed_accounts.txt",
     "enable_oauth": true,
     "oauth_required": true,
     "oauth_issuer": "https://auth.openai.com",
@@ -14,5 +16,8 @@
     "oauth_redirect_uri": "http://localhost:1455/auth/callback",
     "ak_file": "ak.txt",
     "rk_file": "rk.txt",
-    "token_json_dir": "tokens"
+    "token_json_dir": "tokens",
+    "enable_sub2api_output": true,
+    "sub2api_template_file": "sub2api-tmpl.json",
+    "sub2api_output_file": "sub2api.json"
 }

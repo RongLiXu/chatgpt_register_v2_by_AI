@@ -1,0 +1,25 @@
+{
+  "type": "sub2api-data",
+  "version": 1,
+  "proxies": [],
+  "accounts": [
+    {
+      "name": "`codex`-`邮箱`.json",
+      "platform": "openai",
+      "type": "oauth",
+      "credentials": {
+        "type": "codex",
+        "email": "xxx@email.com",
+        "expired": "2026-05-07T15:44:04+08:00",
+        "id_token": "",
+        "account_id": "....",
+        "access_token": "....",
+        "last_refresh": "2026-04-27T15:44:04+08:00",
+        "refresh_token": "..."
+      },
+      "proxy_key": "",
+      "concurrency": 10,
+      "priority": 1
+    }
+  ]
+}

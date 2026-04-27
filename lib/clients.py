@@ -1324,10 +1324,13 @@ class TokenManager:
         self.token_json_dir = config.get("token_json_dir", "tokens")
         self.upload_api_url = config.get("upload_api_url", "")
         self.upload_api_token = config.get("upload_api_token", "")
+        self.sub2api_template_file = config.get("sub2api_template_file", "sub2api-tmpl.json")
+        self.sub2api_output_file = config.get("sub2api_output_file", "sub2api.json")
+        self.enable_sub2api_output = bool(config.get("enable_sub2api_output", True))
         
         # 确保 token 目录存在
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.token_dir = self.token_json_dir if os.path.isabs(self.token_json_dir) else os.path.join(base_dir, self.token_json_dir)
+        self.base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.token_dir = self.token_json_dir if os.path.isabs(self.token_json_dir) else os.path.join(self.base_dir, self.token_json_dir)
         os.makedirs(self.token_dir, exist_ok=True)
 
     def save_tokens(self, email, tokens):
@@ -1388,9 +1391,84 @@ class TokenManager:
             with open(token_path, "w", encoding="utf-8") as f:
                 json.dump(token_data, f, ensure_ascii=False, indent=2)
 
+        if self.enable_sub2api_output:
+            self._append_sub2api_account(token_data)
+
         # 上传到 CPA 管理平台（如果配置了）
         if self.upload_api_url:
             self._upload_token_json(token_path)
+
+    def _project_path(self, path: str) -> str:
+        """将相对路径解析到项目根目录。"""
+        return path if os.path.isabs(path) else os.path.join(self.base_dir, path)
+
+    def _load_sub2api_base(self, output_path: str, template_path: str) -> Dict[str, Any]:
+        """加载 sub2api 输出文件；不存在时从模板初始化并清空占位账号。"""
+        source_path = output_path if os.path.exists(output_path) else template_path
+        if os.path.exists(source_path):
+            with open(source_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {"type": "sub2api-data", "version": 1, "proxies": [], "accounts": []}
+
+        if not isinstance(data, dict):
+            data = {"type": "sub2api-data", "version": 1, "proxies": [], "accounts": []}
+        data.setdefault("type", "sub2api-data")
+        data.setdefault("version", 1)
+        data.setdefault("proxies", [])
+
+        accounts = data.get("accounts")
+        if not isinstance(accounts, list):
+            accounts = []
+
+        # 首次从模板创建输出文件时，去掉示例占位账号。
+        if source_path == template_path and not os.path.exists(output_path):
+            accounts = [
+                item for item in accounts
+                if not str((item or {}).get("name", "")).startswith("`codex`-")
+            ]
+
+        data["accounts"] = accounts
+        return data
+
+    def _append_sub2api_account(self, token_data: Dict[str, Any]) -> None:
+        """按 sub2api 导入模板追加或更新账号。"""
+        email = str(token_data.get("email") or "").strip()
+        if not email:
+            return
+
+        output_path = self._project_path(self.sub2api_output_file)
+        template_path = self._project_path(self.sub2api_template_file)
+        account_name = f"codex-{email}.json"
+        account_item = {
+            "name": account_name,
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": token_data,
+            "proxy_key": "",
+            "concurrency": 10,
+            "priority": 1,
+        }
+
+        with _file_lock:
+            data = self._load_sub2api_base(output_path, template_path)
+            accounts = data.get("accounts") or []
+            replaced = False
+            for index, item in enumerate(accounts):
+                if not isinstance(item, dict):
+                    continue
+                credentials = item.get("credentials") or {}
+                if item.get("name") == account_name or credentials.get("email") == email:
+                    accounts[index] = account_item
+                    replaced = True
+                    break
+
+            if not replaced:
+                accounts.append(account_item)
+
+            data["accounts"] = accounts
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _upload_token_json(self, filepath):
         """上传 Token JSON 文件到 CPA 管理平台"""
