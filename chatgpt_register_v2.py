@@ -88,6 +88,103 @@ def load_account_credentials(input_file):
     return accounts
 
 
+def parse_indexes(indexes_text, total):
+    """解析账号选择表达式，支持 1,2,4 / 2-6 / -3 / 3-。"""
+    if not str(indexes_text or "").strip():
+        return []
+
+    indexes = []
+    seen = set()
+
+    def add_index(index):
+        if index <= 0:
+            raise ValueError(f"--indexes 必须从 1 开始: {indexes_text}")
+        if index > total:
+            raise ValueError(f"--indexes 包含越界序号 {index}，账号总数为 {total}")
+        if index not in seen:
+            indexes.append(index)
+            seen.add(index)
+
+    for raw_item in str(indexes_text).split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+
+        if "-" in item:
+            if item.count("-") != 1:
+                raise ValueError(f"--indexes 范围格式错误: {item}")
+            start_text, end_text = [part.strip() for part in item.split("-", 1)]
+
+            if start_text and not start_text.isdigit():
+                raise ValueError(f"--indexes 范围起始值无效: {item}")
+            if end_text and not end_text.isdigit():
+                raise ValueError(f"--indexes 范围结束值无效: {item}")
+            if not start_text and not end_text:
+                raise ValueError(f"--indexes 范围不能为空: {item}")
+
+            start = int(start_text) if start_text else 1
+            end = int(end_text) if end_text else total
+            if start <= 0 or end <= 0:
+                raise ValueError(f"--indexes 范围必须从 1 开始: {item}")
+            if start > end:
+                raise ValueError(f"--indexes 范围起始值不能大于结束值: {item}")
+
+            for index in range(start, end + 1):
+                add_index(index)
+            continue
+
+        if not item.isdigit():
+            raise ValueError(f"--indexes 只支持正整数或范围表达式: {indexes_text}")
+        add_index(int(item))
+
+    return indexes
+
+
+def parse_email_filter(emails_text):
+    """解析邮箱过滤列表，如 a@example.com,b@example.com。"""
+    if not str(emails_text or "").strip():
+        return []
+
+    emails = []
+    seen = set()
+    for raw_item in str(emails_text).split(","):
+        email = raw_item.strip().lower()
+        if not email:
+            continue
+        if "@" not in email:
+            raise ValueError(f"--emails 包含无效邮箱: {raw_item.strip()}")
+        if email not in seen:
+            emails.append(email)
+            seen.add(email)
+    return emails
+
+
+def select_accounts(accounts, indexes_text="", emails_text=""):
+    """按离散序号或邮箱筛选账号。"""
+    if indexes_text and emails_text:
+        raise ValueError("--indexes 和 --emails 不能同时使用")
+
+    indexes = parse_indexes(indexes_text, len(accounts))
+    if indexes:
+        selected = []
+        total = len(accounts)
+        for index in indexes:
+            if index > total:
+                raise ValueError(f"--indexes 包含越界序号 {index}，账号总数为 {total}")
+            selected.append(accounts[index - 1])
+        return selected
+
+    emails = parse_email_filter(emails_text)
+    if emails:
+        account_map = {email: (email, password) for email, password in accounts}
+        missing = [email for email in emails if email not in account_map]
+        if missing:
+            raise ValueError(f"--emails 中账号不存在于输入文件: {', '.join(missing)}")
+        return [account_map[email] for email in emails]
+
+    return accounts
+
+
 def normalize_failure_reason(reason):
     """清理失败原因，避免写入多行破坏结果文件格式。"""
     text = str(reason or "unknown").strip()
@@ -212,6 +309,8 @@ def main():
     parser.add_argument('-i', '--input-file', default="", help='本地账号文件（默认读取配置 input_file 或 accounts.txt）')
     parser.add_argument('-n', '--num', type=int, default=0, help='处理账号数量（默认: 0，表示全部）')
     parser.add_argument('-w', '--workers', type=int, default=1, help='并发线程数（默认: 1）')
+    parser.add_argument('--indexes', default="", help='按序号选择账号，支持 1,2,4 / 2-6 / -3 / 3-')
+    parser.add_argument('--emails', default="", help='按邮箱选择账号，多个邮箱用英文逗号分隔')
     parser.add_argument('--no-oauth', action='store_true', help='禁用 OAuth 登录')
     args = parser.parse_args()
     
@@ -225,6 +324,7 @@ def main():
     
     input_file = args.input_file or config.get("input_file", "accounts.txt")
     accounts = load_account_credentials(input_file)
+    accounts = select_accounts(accounts, indexes_text=args.indexes, emails_text=args.emails)
     if args.num and args.num > 0:
         accounts = accounts[:args.num]
 
