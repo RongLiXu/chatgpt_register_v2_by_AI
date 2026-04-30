@@ -1,255 +1,444 @@
-# ChatGPT 自动注册工具 v2.0
+# ChatGPT / OpenAI OAuth Token 获取工具
 
-基于 CloudMail 临时邮箱服务的 ChatGPT 自动注册与 OAuth Token 生成工具。
+基于本地账号密码、CloudMail 邮箱 OTP 和 OpenAI OAuth 流程的批量登录工具。
 
-## ✨ v2.0 架构重构
+当前仓库的主入口是 `chatgpt_register_v2.py`，其实际职责是：
 
-项目已完成深度重构，采用模块化架构，代码更清晰、更易维护：
+- 从 `accounts.txt` 读取账号密码
+- 自动执行 OpenAI 登录
+- 自动从 CloudMail 拉取邮箱验证码
+- 获取 `access_token` / `refresh_token` / `id_token` / `session_token`
+- 将结果写入 `tokens/`、`ak.txt`、`rk.txt`、`sub2api.json`
 
-### 核心改进
+> 代码中仍保留“新账号注册引擎”，但当前 CLI 暴露的默认工作模式是“已有账号登录获取 token”。
 
-- ✅ **模块化架构**：lib/ 目录精简为 3 个核心文件，职责清晰
-- ✅ **逻辑整合优化**：操作类统一管理，减少代码冗余
-- ✅ **完整注册流程**：支持新账号注册 + 已有账号登录
-- ✅ **OAuth Token 获取**：自动获取 Access Token / Refresh Token / Session Token
-- ✅ **智能重试机制**：密码注册、验证码获取、登录流程均支持重试
-- ✅ **高并发支持**：支持多线程并发注册
+## 项目现状
 
-## 📦 项目结构
+### 已实现能力
 
-```
+- 本地账号批量登录
+- 按序号或邮箱筛选待处理账号
+- CloudMail 邮件轮询获取 OTP
+- OpenAI OAuth + PKCE 换取 Token
+- Sentinel PoW Token 生成与提交
+- Workspace 自动选择
+- Token 多目标落盘
+- `sub2api.json` 自动生成 / 更新
+- 登录过程中遇到手机号补录时，支持控制台交互继续流程
+- 失败账号写入 `failed_accounts.txt`
+
+### 主流程
+
+1. 读取本地账号文件
+2. 检查出口 IP 地理位置
+3. 初始化 OAuth 流程并获取 `oai-did`
+4. 请求 Sentinel Token
+5. 提交邮箱
+6. 提交密码
+7. 从 CloudMail 获取邮箱 OTP
+8. 校验 OTP
+9. 获取 / 选择 Workspace
+10. 跟随 OAuth 重定向链
+11. 用授权回调换取 Token
+12. 输出到多个文件
+
+## 项目结构
+
+```text
 .
-├── lib/                          # 核心库模块（3 个文件）
-│   ├── clients.py                # 所有客户端类（HTTP、OpenAI、CloudMail、OAuth、Token 管理器）
-│   ├── utils.py                  # 工具函数（密码生成、Cookie 提取、日志格式化等）
-│   └── core.py                   # 注册引擎 + 所有操作类
-├── chatgpt_register_v2.py        # 主程序入口
-├── config.json                   # 配置文件
-├── .env                          # 环境变量（可选）
-└── README.md                     # 本文档
+├── chatgpt_register_v2.py   # CLI 入口：批量登录并获取 token
+├── lib/
+│   ├── clients.py           # HTTP / CloudMail / OAuth / TokenManager
+│   ├── core.py              # RegistrationEngine 与登录/注册/OTP/手机号流程
+│   ├── utils.py             # 常量、配置、Cookie/Token 辅助函数
+│   └── __init__.py
+├── config.example.json      # 配置模板
+├── config.json              # 本地配置
+├── accounts.txt             # 本地账号文件
+├── tokens/                  # 每个账号的 JSON token 文件
+├── ak.txt                   # access_token 列表
+├── rk.txt                   # refresh_token 列表
+├── sub2api-tmpl.json        # sub2api 模板
+└── sub2api.json             # sub2api 导出文件
 ```
 
-### 核心模块说明
+## 关键模块说明
 
-#### lib/clients.py
-所有客户端和管理器的集合：
-- `SentinelTokenGenerator`: Sentinel Token 生成器（纯 Python 实现）
-- `HTTPClient`: 基础 HTTP 客户端封装
-- `OpenAIHTTPClient`: OpenAI 专用 HTTP 客户端（IP 检查、Sentinel Token）
-- `CloudMailService`: CloudMail 邮箱服务客户端
-- `OAuthManager`: OAuth 流程管理器（授权、Token 交换）
-- `TokenManager`: Token 管理器（保存和加载 Token）
-- 数据模型：`RegistrationResult`, `SignupFormResult`, `OAuthStart`
-- 常量配置：`OPENAI_API_ENDPOINTS`, `OPENAI_PAGE_TYPES`, `OTP_CODE_PATTERN`
-- 工具函数：`generate_oauth_url()`, `submit_callback_url()`, `load_config()`
+### `chatgpt_register_v2.py`
 
-#### lib/utils.py
-通用工具函数：
-- `generate_password()`: 随机密码生成
-- `generate_random_user_info()`: 随机用户信息生成
-- `extract_session_token_from_cookie_jar()`: 从 Cookie Jar 提取 Session Token
-- `extract_session_token_from_cookie_text()`: 从 Cookie 文本提取 Session Token
-- `flatten_set_cookie_headers()`: 扁平化 Set-Cookie 头
-- `extract_request_cookie_header()`: 提取请求 Cookie 头
-- `dump_session_cookies()`: 导出会话 Cookie
-- `format_log_message()`: 日志消息格式化
+负责：
 
-#### lib/core.py
-注册引擎和所有操作类：
-- `RegistrationEngine`: 注册引擎主类（协调整个注册流程）
-- `EmailOperations`: 邮箱操作（创建临时邮箱）
-- `OTPOperations`: 验证码操作（发送、获取、验证 OTP）
-- `AuthOperations`: 认证操作（OAuth 启动、Device ID、Sentinel 验证）
-- `LoginOperations`: 登录操作（提交邮箱、密码、重触发 OTP）
-- `AccountOperations`: 账户创建操作（注册密码、创建用户账户）
-- `WorkspaceOperations`: Workspace 操作（获取、选择 Workspace）
-- `RedirectOperations`: 重定向处理（跟随 OAuth 重定向链）
-- `TokenOperations`: Token 获取操作（捕获 Session Token、处理 OAuth 回调）
+- 解析命令行参数
+- 读取账号文件
+- 选择账号范围
+- 初始化 `CloudMailService`
+- 初始化 `TokenManager`
+- 串行或并发执行 `RegistrationEngine.run_login()`
 
-## 功能特性
+支持的筛选参数：
 
-- 🚀 使用 CloudMail 临时邮箱服务自动创建邮箱
-- 🌐 支持自定义域名配置
-- 🤖 自动注册 ChatGPT 账号并获取验证码
-- 🔑 自动生成 OAuth Token（Access Token / Refresh Token / Session Token）
-- ⚡ 支持高并发注册（推荐 5-8 线程）
-- 🔄 智能重试机制（密码注册、验证码、登录流程）
-- 💾 自动保存账号信息和 Token 到文件
-- 📊 实时显示注册进度和成功率
-- 🔐 支持已有账号自动登录获取 Token
+- `--indexes`：按序号选择，例如 `5`、`1,3,7`、`2-6`、`-3`、`3-`
+- `--emails`：按邮箱选择，多个邮箱用英文逗号分隔
 
-## 环境要求
+### `lib/core.py`
 
-- Python 3.7+
-- CloudMail 临时邮箱服务（需要管理员账号）
-- 代理（可选，用于访问 OpenAI 服务）
+核心流程编排：
 
-## 安装依赖
+- `RegistrationEngine.run_login()`：已有账号登录主流程
+- `RegistrationEngine.run()`：新账号注册主流程
+- `AuthOperations`：OAuth 初始化、`oai-did`、Sentinel
+- `LoginOperations`：登录邮箱/密码提交、重触发 OTP
+- `OTPOperations`：邮件验证码获取和校验
+- `WorkspaceOperations`：Workspace 提取与选择
+- `RedirectOperations`：OAuth 重定向跟随和回调恢复
+- 手机号流程：当登录后跳到 `add-phone` / `phone-otp` 页面时，支持控制台输入手机号和短信验证码继续
+
+### `lib/clients.py`
+
+包含：
+
+- `SentinelTokenGenerator`：纯 Python 生成 Sentinel requirements token
+- `HTTPClient` / `OpenAIHTTPClient`
+- `CloudMailService`
+- `OAuthManager`
+- `TokenManager`
+
+`TokenManager.save_tokens()` 会同时处理：
+
+- `ak.txt`
+- `rk.txt`
+- `tokens/<email>.json`
+- `sub2api.json`
+- 可选上传到外部 API（若配置 `upload_api_url`）
+
+### `lib/utils.py`
+
+提供：
+
+- OpenAI 端点常量
+- OAuth 常量
+- 配置加载
+- 随机密码与用户资料生成
+- Cookie / session token 提取
+- 日志格式化
+
+## 依赖与运行环境
+
+`pyproject.toml` 当前声明：
+
+```toml
+requires-python = ">=3.14"
+```
+
+依赖：
 
 ```bash
-pip install curl_cffi
+pip install curl-cffi requests
+```
+
+如果你使用仓库自带虚拟环境，也可以直接执行：
+
+```bash
+.venv/bin/python chatgpt_register_v2.py --indexes 5
 ```
 
 ## 配置说明
 
-复制 `config.example.json` 为 `config.json` 并修改配置：
+复制 `config.example.json` 为 `config.json` 后填写：
 
 ```json
 {
-    "cloudmail_url": "https://your-cloudmail-api.com",
-    "cloudmail_admin_email": "admin@example.com",
-    "cloudmail_admin_password": "your_password",
-    "cloudmail_domains": ["domain1.com", "domain2.com"],
-    "cloudmail_subdomain": "",
-    "proxy": "http://127.0.0.1:7890",
-    "output_file": "registered_accounts.txt",
-    "enable_oauth": true,
-    "oauth_required": true,
-    "token_json_dir": "tokens",
-    "timeout": 30
+  "cloudmail_admin_email": "admin@example.com",
+  "cloudmail_admin_password": "your_password_here",
+  "cloudmail_domains": [],
+  "cloudmail_subdomain": "",
+  "cloudmail_url": "",
+  "timeout": 30,
+  "proxy": "http://127.0.0.1:10808",
+  "input_file": "accounts.txt",
+  "output_file": "registered_accounts.txt",
+  "failed_output_file": "failed_accounts.txt",
+  "enable_oauth": true,
+  "oauth_required": true,
+  "oauth_issuer": "https://auth.openai.com",
+  "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+  "oauth_redirect_uri": "http://localhost:1455/auth/callback",
+  "ak_file": "ak.txt",
+  "rk_file": "rk.txt",
+  "token_json_dir": "tokens",
+  "enable_sub2api_output": true,
+  "sub2api_template_file": "sub2api-tmpl.json",
+  "sub2api_output_file": "sub2api.json"
 }
 ```
 
-### 重要配置项说明
+### 关键配置项
 
-1. **cloudmail_url**：CloudMail API 地址
-2. **cloudmail_admin_email** 和 **cloudmail_admin_password**：管理员账号
-3. **cloudmail_domains**：可用域名列表
-4. **proxy**：代理地址（格式：`http://host:port` 或 `socks5://host:port`）
-5. **enable_oauth**：是否启用 OAuth 登录
-6. **oauth_required**：OAuth 失败时是否视为注册失败
-7. **token_json_dir**：Token JSON 文件保存目录
+| 字段 | 说明 |
+|---|---|
+| `cloudmail_url` | CloudMail 服务地址 |
+| `cloudmail_admin_email` | CloudMail 管理员邮箱 |
+| `cloudmail_admin_password` | CloudMail 管理员密码 |
+| `cloudmail_domains` | 生成邮箱可用域名列表 |
+| `cloudmail_subdomain` | 可选子域名前缀 |
+| `proxy` | 请求代理 |
+| `input_file` | 本地账号文件 |
+| `output_file` | 成功账号输出文件 |
+| `failed_output_file` | 失败账号输出文件 |
+| `enable_oauth` | 是否要求获取 OAuth Token |
+| `oauth_required` | OAuth 失败时是否判定整体失败 |
+| `ak_file` | access token 输出文件 |
+| `rk_file` | refresh token 输出文件 |
+| `token_json_dir` | 单账号 JSON 文件目录 |
+| `enable_sub2api_output` | 是否同步输出 `sub2api.json` |
+
+## 账号文件格式
+
+`accounts.txt` 每行一个账号，支持三种格式：
+
+```text
+email@example.com----password123
+email@example.com,password123
+email@example.com password123
+```
+
+注释行和空行会被忽略。
 
 ## 使用方法
 
+### 处理全部账号
+
 ```bash
-# 注册 1 个账号（默认）
-python chatgpt_register_v2.py
-
-# 注册 5 个账号，使用 3 个线程
-python chatgpt_register_v2.py -n 5 -w 3
-
-# 注册 10 个账号，使用 5 个线程，不启用 OAuth
-python chatgpt_register_v2.py -n 10 -w 5 --no-oauth
+python3 chatgpt_register_v2.py
 ```
 
-### 命令行参数
+### 只处理第 5 条账号
 
-- `-n, --num`: 注册账号数量（默认: 1）
-- `-w, --workers`: 并发线程数（默认: 1）
-- `--no-oauth`: 禁用 OAuth 登录
+```bash
+python3 chatgpt_register_v2.py -i accounts.txt --indexes 5 -w 1
+```
 
-### 推荐配置
+### 处理多个离散账号
 
-| 场景 | 线程数 | 说明 |
-|------|--------|------|
-| 稳定优先 | 1 | 最稳定，速度较慢 |
-| 平衡模式 | 2-3 | 稳定性好，速度适中 |
-| 速度优先 | 4-5 | 速度快，需要稳定网络 |
+```bash
+python3 chatgpt_register_v2.py --indexes 1,3,8 -w 3
+```
 
-### 输出文件
+### 处理一个范围
 
-- `registered_accounts.txt`：账号密码列表（格式：`email----password----oauth=ok/failed`）
-- `tokens/`：每个账号的完整 Token JSON 文件
-  - `access_token`: 访问令牌
-  - `refresh_token`: 刷新令牌
-  - `id_token`: ID 令牌
-  - `session_token`: 会话令牌
+```bash
+python3 chatgpt_register_v2.py --indexes 2-6 -w 2
+```
 
-## 工作原理
+### 按邮箱筛选
 
-### 完整注册流程
+```bash
+python3 chatgpt_register_v2.py --emails a@example.com,b@example.com
+```
 
-1. **IP 检查**：验证客户端 IP 地理位置
-2. **创建邮箱**：通过 CloudMail 创建临时邮箱
-3. **OAuth 初始化**：启动 OAuth 授权流程，获取 Device ID
-4. **Sentinel 验证**：获取并验证 Sentinel POW Token
-5. **提交注册**：提交邮箱到注册入口
-6. **设置密码**：生成并提交随机密码（带重试）
-7. **发送验证码**：请求发送邮箱验证码
-8. **验证邮箱**：获取并验证邮箱验证码（带重试）
-9. **创建账户**：提交用户信息完成账户创建
-10. **重新登录**：新账号需重新登录获取 Token
-11. **获取 Workspace**：获取并选择 Workspace ID
-12. **跟随重定向**：跟随 OAuth 重定向链获取回调 URL
-13. **Token 交换**：通过回调 URL 获取 Access Token / Refresh Token
-14. **保存结果**：保存账号信息和 Token 到文件
+### 限制实际处理数量
 
-### 智能重试机制
+```bash
+python3 chatgpt_register_v2.py --indexes 1-20 -n 5
+```
 
-- **密码注册重试**：遇到 400 错误自动重试（最多 3 次）
-- **验证码获取重试**：支持多次尝试获取验证码
-- **登录流程重试**：登录失败时自动重新触发 OTP
-- **OAuth 回调兜底**：回调失败时通过 `/api/auth/session` 兜底获取 Token
+### 禁用 OAuth
 
-### 已有账号处理
+```bash
+python3 chatgpt_register_v2.py --indexes 5 --no-oauth
+```
 
-- 自动检测账号是否已注册
-- 切换到登录流程
-- 自动获取并验证登录验证码
-- 获取 Token 并保存
+## 命令行参数
 
-## 注意事项
+| 参数 | 说明 |
+|---|---|
+| `-i, --input-file` | 指定账号文件，默认读取 `config.input_file` 或 `accounts.txt` |
+| `-n, --num` | 处理数量上限，`0` 表示全部 |
+| `-w, --workers` | 并发线程数 |
+| `--indexes` | 按序号筛选账号 |
+| `--emails` | 按邮箱筛选账号 |
+| `--no-oauth` | 禁用 OAuth token 保存 |
 
-### 1. CloudMail 服务
-- 需要自己搭建或使用现有的 CloudMail 服务
-- 确保 CloudMail 服务可正常访问
-- 管理员账号需要有创建邮箱的权限
+## 输出文件
 
-### 2. 代理设置
-- 如果在国内使用，必须配置代理
-- 确保代理可以访问 OpenAI 服务
-- 推荐使用稳定的代理服务
+### `registered_accounts.txt`
 
-### 3. 并发控制
-- **推荐并发数**：1-5 线程
-- **不推荐**：超过 5 线程（可能导致 IP 限制或服务不稳定）
-- 首次使用建议从 1 线程开始测试
+成功账号记录，典型格式：
 
-### 4. Token 有效期
-- Access Token 有效期较短（通常几小时）
-- Refresh Token 可用于刷新 Access Token
-- Session Token 用于浏览器会话
-- 建议定期备份 Token 文件
+```text
+email@example.com----password----oauth=ok
+email@example.com----password----oauth=failed
+```
 
-### 5. 错误处理
-- 程序会自动处理大部分错误并重试
-- 如遇到持续失败，检查：
-  - 代理是否正常
-  - CloudMail 服务是否可用
-  - 配置文件是否正确
-  - 网络连接是否稳定
+### `failed_accounts.txt`
+
+失败账号记录：
+
+```text
+email@example.com----password----failed=reason
+```
+
+### `ak.txt`
+
+每行一个 `access_token`。
+
+### `rk.txt`
+
+每行一个 `refresh_token`。
+
+### `tokens/<email>.json`
+
+示例结构：
+
+```json
+{
+  "type": "codex",
+  "email": "user@example.com",
+  "expired": "2026-05-07T15:44:04+08:00",
+  "id_token": "",
+  "account_id": "account_xxx",
+  "access_token": "eyJ...",
+  "last_refresh": "2026-04-27T15:44:04+08:00",
+  "refresh_token": "def..."
+}
+```
+
+### `sub2api.json`
+
+若启用 `enable_sub2api_output`，程序会根据 `sub2api-tmpl.json` 自动追加或更新账号，输出格式适配 sub2api 导入。
+
+## 登录流程细节
+
+### 1. IP 地理位置检查
+
+程序会访问：
+
+```text
+https://cloudflare.com/cdn-cgi/trace
+```
+
+若检测到 `CN` / `HK` / `MO` / `TW`，会直接视为不支持。
+
+### 2. OAuth 与 PKCE
+
+通过 `generate_oauth_url()` 生成：
+
+- `state`
+- `code_verifier`
+- `code_challenge`
+- 授权地址
+
+之后通过回调地址向 `https://auth.openai.com/oauth/token` 交换 Token。
+
+### 3. Sentinel
+
+登录前会：
+
+- 获取 `oai-did`
+- 生成 Sentinel requirements token
+- 请求 `https://sentinel.openai.com/backend-api/sentinel/req`
+- 将返回 token 放入 `openai-sentinel-token` 请求头
+
+### 4. OTP
+
+验证码来源不是 IMAP，而是 CloudMail HTTP API：
+
+- `/api/public/emailList`
+
+程序会轮询邮件列表，提取 6 位验证码，并调用 OpenAI OTP 校验接口。
+
+### 5. 手机号补录
+
+如果 OAuth 收尾阶段跳转到：
+
+- `about-you`
+- `add-phone`
+- `phone-verification`
+- `phone-otp`
+
+程序会进入控制台交互：
+
+- 输入国家/地区
+- 输入手机号
+- 输入短信验证码
+
+然后继续恢复 OAuth 回调链路。
+
+这部分是当前流程里唯一明确依赖人工输入的分支。
+
+## 关键 OpenAI 接口
+
+以下端点可直接从代码中确认：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `POST` | `https://sentinel.openai.com/backend-api/sentinel/req` | Sentinel 校验 |
+| `POST` | `https://auth.openai.com/api/accounts/authorize/continue` | 提交邮箱并进入登录/注册页面 |
+| `POST` | `https://auth.openai.com/api/accounts/password/verify` | 登录密码校验 |
+| `POST` | `https://auth.openai.com/api/accounts/user/register` | 新账号设置密码 |
+| `GET` | `https://auth.openai.com/api/accounts/email-otp/send` | 触发邮箱验证码发送 |
+| `POST` | `https://auth.openai.com/api/accounts/email-otp/validate` | 校验邮箱验证码 |
+| `POST` | `https://auth.openai.com/api/accounts/create_account` | 创建账号资料 |
+| `POST` | `https://auth.openai.com/api/accounts/workspace/select` | 选择 Workspace |
+| `POST` | `https://auth.openai.com/oauth/token` | OAuth token 交换 |
+
+## 并发建议
+
+- `-w 1`：最稳
+- `-w 2~3`：推荐
+- `-w >5`：可能触发限流、OTP 混淆、CloudMail 竞争或 OpenAI 风控
+
+虽然代码支持并发，但邮件 OTP 本身存在时序依赖，实际生产使用建议先小并发验证。
 
 ## 常见问题
 
-**Q: 注册失败，提示 IP 地理位置不支持？**  
-A: 确保使用的代理 IP 位于支持的地区（如美国、欧洲等）。
+### 1. `IP 地理位置不支持`
 
-**Q: 验证码获取失败？**  
-A: 检查 CloudMail 服务是否正常，邮件是否能正常接收。
+检查代理出口。代码会直接拦截 `CN/HK/MO/TW`。
 
-**Q: OAuth Token 获取失败？**  
-A: 程序会自动重试，如果持续失败，可以设置 `oauth_required: false` 先完成注册。
+### 2. 一直拿不到 OTP
 
-**Q: 并发注册时成功率下降？**  
-A: 降低并发线程数，推荐使用 2-3 个线程。
+优先检查：
 
-## 开发说明
+- CloudMail 管理员配置是否正确
+- `cloudmail_url` 是否可访问
+- 目标邮箱域名是否真实可用
+- OpenAI 邮件是否实际投递到 CloudMail
 
-### 代码结构设计
+### 3. 登录成功但没有 token
 
-- **clients.py**：客户端层，封装所有外部服务调用（HTTP、邮箱、OAuth）和数据模型
-- **utils.py**：工具层，提供通用工具函数（密码生成、Cookie 处理、日志格式化）
-- **core.py**：业务层，实现核心注册逻辑和流程编排
+检查：
 
-### 扩展开发
+- `enable_oauth`
+- `oauth_required`
+- 是否卡在手机号补录页面
+- `tokens/` 是否有对应 JSON 文件
 
-如需扩展功能，建议：
-1. 在 `clients.py` 中添加新的客户端类或数据模型
-2. 在 `utils.py` 中添加新的工具函数
-3. 在 `core.py` 中添加新的操作类或修改注册流程
-4. 保持模块间的低耦合，遵循单一职责原则
+### 4. `--indexes` / `--emails` 同时用了
+
+代码会直接报错，两者互斥。
+
+### 5. 手机号页面卡住
+
+该分支需要交互式终端。如果当前环境不是可交互 TTY，流程无法继续。
+
+## 开发备注
+
+### 实际能力与历史命名差异
+
+仓库名称和部分注释仍强调“自动注册”，但从 CLI 入口看，当前最完整、最直接的使用方式是：
+
+- 维护 `accounts.txt`
+- 批量登录已有账号
+- 获取和导出 OAuth Token
+
+如果后续要让 README 与功能继续对齐，建议：
+
+1. 将入口脚本名称与项目标题进一步统一
+2. 将“注册模式”和“登录模式”拆成两个 CLI 子命令
+3. 补充一份手机号交互流程的专门说明
+4. 为 `sub2api.json` 增加字段说明与示例
 
 ## 许可证
 
-MIT License
+仓库内未看到单独的许可证文件；如需开源发布，建议补充 `LICENSE`。

@@ -8,7 +8,9 @@ import base64
 import uuid
 import logging
 import threading
+import sys
 import urllib.parse
+import html
 from typing import Optional, Tuple, Any, List, Set, Dict, Callable
 from datetime import datetime, timezone, timedelta
 
@@ -16,6 +18,7 @@ from .utils import *
 from .clients import *
 
 logger = logging.getLogger(__name__)
+_console_prompt_lock = threading.Lock()
 
 # ==========================================
 class EmailOperations:
@@ -1096,6 +1099,10 @@ class RedirectOperations:
     def __init__(self, engine, log_callback):
         self.engine = engine  # 主引擎引用
         self._log = log_callback
+        self.last_response_url: str = ""
+        self.last_response_status_code: Optional[int] = None
+        self.last_response_headers: Dict[str, str] = {}
+        self.last_response_text: str = ""
     
     @property
     def session(self):
@@ -1132,6 +1139,13 @@ class RedirectOperations:
                     allow_redirects=False,
                     timeout=15
                 )
+                self.last_response_url = current_url
+                self.last_response_status_code = int(response.status_code)
+                try:
+                    self.last_response_headers = dict(response.headers or {})
+                except Exception:
+                    self.last_response_headers = {}
+                self.last_response_text = str(response.text or "")
 
                 location = response.headers.get("Location") or ""
 
@@ -1444,6 +1458,654 @@ class RegistrationEngine:
 
         self._log(f"{label}: Sentinel POW 验证通过")
         return did, sen_token
+
+    def _collect_continue_urls_from_payload(self, payload: Any) -> List[str]:
+        """从响应体中提取可能的 continue URL。"""
+        urls: List[str] = []
+        queue: List[Any] = [payload]
+        visited: Set[int] = set()
+        url_keys = {"continue_url", "continueurl", "next_url", "nexturl", "redirect_url", "redirecturl", "url"}
+
+        while queue:
+            current = queue.pop(0)
+            marker = id(current)
+            if marker in visited:
+                continue
+            visited.add(marker)
+
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    key_text = str(key or "").strip().lower()
+                    if key_text in url_keys and isinstance(value, str):
+                        value_text = str(value or "").strip()
+                        if value_text:
+                            if value_text.startswith("/"):
+                                value_text = urllib.parse.urljoin("https://auth.openai.com", value_text)
+                            urls.append(value_text)
+                    if isinstance(value, (dict, list)):
+                        queue.append(value)
+            elif isinstance(current, list):
+                for item in current:
+                    if isinstance(item, (dict, list)):
+                        queue.append(item)
+
+        unique_urls: List[str] = []
+        seen: Set[str] = set()
+        for item in urls:
+            normalized = str(item or "").strip()
+            if normalized and normalized not in seen:
+                unique_urls.append(normalized)
+                seen.add(normalized)
+        return unique_urls
+
+    def _dedupe_urls(self, urls: List[str]) -> List[str]:
+        """去重并清理 URL 列表，保持原始顺序。"""
+        unique_urls: List[str] = []
+        seen: Set[str] = set()
+        for url in urls:
+            normalized = str(url or "").strip().replace("\\/", "/")
+            if normalized and normalized not in seen:
+                unique_urls.append(normalized)
+                seen.add(normalized)
+        return unique_urls
+
+    def _normalize_auth_url(self, url: str, base_url: str = "https://auth.openai.com") -> str:
+        """将页面中提取的相对 auth URL 规范化。"""
+        value = html.unescape(str(url or "").strip()).replace("\\/", "/")
+        value = value.replace("\\u002F", "/").replace("\\u002f", "/")
+        value = value.rstrip(".,);]")
+        if value.startswith("/"):
+            return urllib.parse.urljoin(base_url, value)
+        return value
+
+    def _get_gate_page_text(self, gate_url: str) -> str:
+        """获取注册门页 HTML，用于提取真实前端协议端点。"""
+        gate_url = str(gate_url or "").strip()
+        cached_url = str(getattr(self.redirect_ops, "last_response_url", "") or "").strip()
+        cached_text = str(getattr(self.redirect_ops, "last_response_text", "") or "")
+        if cached_text and (not gate_url or cached_url == gate_url):
+            return cached_text
+
+        if not gate_url or not self.session:
+            return ""
+
+        try:
+            response = self.session.get(
+                gate_url,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "referer": "https://auth.openai.com/",
+                },
+                allow_redirects=False,
+                timeout=20,
+            )
+            self._log(f"注册门页协议采集: {response.status_code}")
+            return str(response.text or "")
+        except Exception as e:
+            self._log(f"注册门页协议采集失败: {e}", "warning")
+            return ""
+
+    def _extract_account_api_urls(self, text: str, *, mode: str) -> List[str]:
+        """从 HTML/Next 数据/内联 JS 中提取与手机号流程相关的账号 API。"""
+        raw_text = str(text or "")
+        if not raw_text:
+            return []
+
+        normalized_text = html.unescape(raw_text)
+        normalized_text = normalized_text.replace("\\u002F", "/").replace("\\u002f", "/").replace("\\/", "/")
+
+        candidates: List[str] = []
+        patterns = [
+            r"https://auth\.openai\.com/api/accounts/[A-Za-z0-9_./-]+",
+            r"(?<![A-Za-z0-9_./-])/(api/accounts/[A-Za-z0-9_./-]+)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, normalized_text):
+                value = match.group(0)
+                if value.startswith("/api/"):
+                    candidates.append(self._normalize_auth_url(value))
+                elif value.startswith("api/"):
+                    candidates.append(self._normalize_auth_url("/" + value))
+                else:
+                    candidates.append(self._normalize_auth_url(value))
+
+        def _matches(url: str) -> bool:
+            path = urllib.parse.urlparse(url).path.lower()
+            if "/api/accounts/" not in path or "phone" not in path:
+                return False
+            if mode == "phone_submit":
+                return not any(marker in path for marker in ("otp", "verify", "validate"))
+            if mode == "phone_otp":
+                return any(marker in path for marker in ("otp", "verify", "validate"))
+            return True
+
+        return [url for url in self._dedupe_urls(candidates) if _matches(url)]
+
+    def _get_gate_protocol_text(self, gate_url: str) -> str:
+        """合并门页 HTML 和同源前端 JS 资源，提升端点发现准确率。"""
+        page_text = self._get_gate_page_text(gate_url)
+        if not page_text:
+            return ""
+
+        resource_texts = [page_text]
+        script_urls: List[str] = []
+        for pattern in (
+            r'<script[^>]+src=["\']([^"\']+)["\']',
+            r'<link[^>]+href=["\']([^"\']+\.js[^"\']*)["\']',
+        ):
+            for match in re.finditer(pattern, page_text, flags=re.IGNORECASE):
+                src = html.unescape(str(match.group(1) or "").strip())
+                if not src:
+                    continue
+                url = urllib.parse.urljoin(gate_url or "https://auth.openai.com/", src)
+                parsed = urllib.parse.urlparse(url)
+                if parsed.netloc and parsed.netloc != "auth.openai.com":
+                    continue
+                if ".js" not in parsed.path and "/_next/static/" not in parsed.path:
+                    continue
+                script_urls.append(url)
+
+        fetched = 0
+        for script_url in self._dedupe_urls(script_urls)[:12]:
+            try:
+                response = self.session.get(
+                    script_url,
+                    headers={
+                        "accept": "*/*",
+                        "referer": gate_url or "https://auth.openai.com/",
+                    },
+                    timeout=12,
+                )
+                if response.status_code == 200:
+                    resource_texts.append(str(response.text or "")[:500_000])
+                    fetched += 1
+            except Exception as e:
+                self._log(f"门页 JS 资源采集失败: {script_url[:100]} -> {e}", "warning")
+
+        if fetched:
+            self._log(f"门页前端资源采集完成: {fetched} 个 JS")
+        return "\n".join(resource_texts)
+
+    def _candidate_gate_endpoints(self, gate_url: str, *, mode: str) -> List[str]:
+        """优先使用页面暴露的真实端点；未发现时才启用保守兜底。"""
+        protocol_text = self._get_gate_protocol_text(gate_url)
+        discovered = self._extract_account_api_urls(protocol_text, mode=mode)
+        if discovered:
+            self._log(f"从门页资源发现 {mode} 端点 {len(discovered)} 个")
+            return discovered
+
+        self._log(f"未从门页资源发现 {mode} 端点，启用保守兜底端点", "warning")
+        if mode == "phone_otp":
+            fallback = [
+                "https://auth.openai.com/api/accounts/phone-otp/validate",
+                "https://auth.openai.com/api/accounts/phone-otp/verify",
+                "https://auth.openai.com/api/accounts/phone/otp/validate",
+                "https://auth.openai.com/api/accounts/phone/verify",
+                "https://auth.openai.com/api/accounts/verify-phone",
+                "https://auth.openai.com/api/accounts/add-phone/verify",
+            ]
+        else:
+            fallback = [
+                "https://auth.openai.com/api/accounts/add-phone",
+                "https://auth.openai.com/api/accounts/phone",
+                "https://auth.openai.com/api/accounts/phone/add",
+                "https://auth.openai.com/api/accounts/phone/submit",
+                "https://auth.openai.com/api/accounts/phone_number/add",
+            ]
+        return fallback
+
+    def _collect_response_resume_signals(self, response, endpoint: str) -> Tuple[dict, List[str], str, str, str]:
+        """提取响应中的继续信号，返回 json、continue URLs、page type、error、body。"""
+        continue_candidates: List[str] = []
+        location = str(response.headers.get("Location") or "").strip()
+        if location:
+            continue_candidates.append(urllib.parse.urljoin(endpoint, location))
+
+        body_text = str(response.text or "")
+        response_json: dict = {}
+        page_type = ""
+        error_text = ""
+        try:
+            parsed = response.json() or {}
+            if isinstance(parsed, dict):
+                response_json = parsed
+                continue_candidates.extend(self._collect_continue_urls_from_payload(response_json))
+                page_type = str(((response_json.get("page") or {}).get("type") or "")).strip()
+                error_block = response_json.get("error")
+                if isinstance(error_block, dict):
+                    error_text = str(error_block.get("message") or error_block.get("code") or error_block).strip()
+                elif error_block:
+                    error_text = str(error_block).strip()
+                elif response_json.get("errors"):
+                    error_text = str(response_json.get("errors")).strip()
+        except Exception:
+            matches = re.findall(r"https://auth\.openai\.com/[^\s\"'<>]+", body_text)
+            continue_candidates.extend([self._normalize_auth_url(m) for m in matches if m])
+
+        return response_json, self._dedupe_urls(continue_candidates), page_type, error_text, body_text
+
+    def _response_has_forward_progress(
+        self,
+        response,
+        *,
+        response_json: dict,
+        continue_candidates: List[str],
+        page_type: str,
+        body_text: str,
+    ) -> bool:
+        """判断提交是否真的推进了流程，避免只凭 200 误判。"""
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code in (301, 302, 303, 307, 308):
+            return bool(str(response.headers.get("Location") or "").strip())
+        if status_code == 204:
+            return True
+        if status_code < 200 or status_code >= 300:
+            return False
+        if continue_candidates:
+            return True
+
+        normalized_page_type = str(page_type or "").lower()
+        if any(marker in normalized_page_type for marker in ("phone", "otp", "verification", "consent", "workspace")):
+            return True
+
+        lower_body = str(body_text or "").lower()
+        if any(marker in lower_body for marker in ("continue_url", "phone-verification", "phone_otp", "phone-otp", "verify-phone")):
+            return True
+
+        if isinstance(response_json, dict):
+            for key in ("success", "ok", "completed", "verified"):
+                if response_json.get(key) is True:
+                    return True
+
+        return False
+
+    def _prompt_phone_country_and_number(self) -> Optional[Dict[str, str]]:
+        """在控制台中交互式获取国家和手机号。"""
+        if not getattr(sys, "stdin", None) or not sys.stdin.isatty():
+            self._log("当前环境不是交互式终端，无法输入手机号", "error")
+            return None
+
+        country_options = [
+            {"name": "United States", "iso2": "US", "dial": "+1"},
+            {"name": "United Kingdom", "iso2": "GB", "dial": "+44"},
+            {"name": "Canada", "iso2": "CA", "dial": "+1"},
+            {"name": "Australia", "iso2": "AU", "dial": "+61"},
+            {"name": "Germany", "iso2": "DE", "dial": "+49"},
+            {"name": "France", "iso2": "FR", "dial": "+33"},
+            {"name": "Japan", "iso2": "JP", "dial": "+81"},
+            {"name": "Singapore", "iso2": "SG", "dial": "+65"},
+            {"name": "Hong Kong", "iso2": "HK", "dial": "+852"},
+            {"name": "Taiwan", "iso2": "TW", "dial": "+886"},
+            {"name": "South Korea", "iso2": "KR", "dial": "+82"},
+            {"name": "India", "iso2": "IN", "dial": "+91"},
+            {"name": "Custom", "iso2": "", "dial": ""},
+        ]
+
+        with _console_prompt_lock:
+            self._log("检测到 add-phone 页面，准备在控制台录入手机号")
+            print("\n请选择手机号所属国家/地区：")
+            for idx, item in enumerate(country_options, 1):
+                label = f"{item['name']} ({item['dial']})" if item["dial"] else "自定义"
+                print(f"  {idx}. {label}")
+
+            selected = None
+            while not selected:
+                raw_choice = input("请输入序号（默认 1）: ").strip()
+                if not raw_choice:
+                    selected = country_options[0]
+                    break
+                if not raw_choice.isdigit():
+                    print("输入无效，请填写数字序号。")
+                    continue
+                index = int(raw_choice)
+                if index < 1 or index > len(country_options):
+                    print("输入超出范围，请重试。")
+                    continue
+                selected = country_options[index - 1]
+
+            country_name = str(selected.get("name") or "").strip()
+            country_iso2 = str(selected.get("iso2") or "").strip().upper()
+            dial_code = str(selected.get("dial") or "").strip()
+
+            if country_name == "Custom":
+                country_name = input("国家/地区名称（如 Brazil）: ").strip() or "Custom"
+                country_iso2 = (input("ISO2 国家代码（如 BR，可留空）: ").strip() or "").upper()
+                while True:
+                    dial_code = input("国际区号（如 +55）: ").strip()
+                    if re.fullmatch(r"\+\d{1,4}", dial_code):
+                        break
+                    print("区号格式错误，请使用 + 加数字，如 +55。")
+
+            raw_phone = ""
+            while not raw_phone:
+                raw_phone = input("请输入手机号（可带空格/横杠）: ").strip()
+                if not raw_phone:
+                    print("手机号不能为空。")
+
+            if raw_phone.startswith("+"):
+                e164_phone = "+" + re.sub(r"\D", "", raw_phone)
+            else:
+                local_number = re.sub(r"\D", "", raw_phone)
+                e164_phone = f"{dial_code}{local_number}"
+
+            e164_phone = re.sub(r"[^\d+]", "", e164_phone)
+            if not re.fullmatch(r"\+\d{6,18}", e164_phone):
+                self._log(f"手机号格式不合法: {e164_phone}", "error")
+                return None
+
+            return {
+                "country_name": country_name,
+                "country_iso2": country_iso2,
+                "dial_code": dial_code,
+                "phone_e164": e164_phone,
+            }
+
+    def _prompt_sms_otp_code(self) -> Optional[str]:
+        """在控制台中交互式获取短信验证码。"""
+        if not getattr(sys, "stdin", None) or not sys.stdin.isatty():
+            self._log("当前环境不是交互式终端，无法输入短信验证码", "error")
+            return None
+
+        with _console_prompt_lock:
+            self._log("已进入手机号验证码页面，请在控制台输入短信验证码")
+            for _ in range(5):
+                raw_code = input("请输入短信验证码（4-8位数字）: ").strip()
+                code = re.sub(r"\D", "", raw_code)
+                if re.fullmatch(r"\d{4,8}", code):
+                    return code
+                print("验证码格式无效，请输入 4-8 位数字。")
+        return None
+
+    def _submit_phone_otp_and_resume(
+        self,
+        gate_url: str,
+        workspace_id: str = "",
+        country_iso2: str = "",
+        dial_code: str = "",
+        phone_e164: str = "",
+    ) -> Tuple[Optional[str], str]:
+        """手动输入短信验证码并提交，尝试恢复 OAuth 回调链路。"""
+        otp_code = self._prompt_sms_otp_code()
+        if not otp_code:
+            return None, gate_url
+
+        did = str(self.session.cookies.get("oai-did") or "").strip() if self.session else ""
+        sentinel_token = None
+        if did:
+            for flow in ("oauth_phone_otp", "oauth_add_phone", "authorize_continue"):
+                try:
+                    sentinel_token = self.http_client.check_sentinel(did, flow=flow)
+                except Exception:
+                    sentinel_token = None
+                if sentinel_token:
+                    break
+
+        headers = {
+            "referer": gate_url,
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": "https://auth.openai.com",
+        }
+        if sentinel_token and did:
+            headers["openai-sentinel-token"] = json.dumps({
+                "p": "",
+                "t": "",
+                "c": sentinel_token,
+                "id": did,
+                "flow": "oauth_phone_otp",
+            })
+
+        candidate_endpoints = self._candidate_gate_endpoints(gate_url, mode="phone_otp")
+
+        payload_candidates = [
+            {"code": otp_code},
+            {"otp": otp_code},
+            {"verification_code": otp_code},
+            {"phone_otp": otp_code},
+            {"code": otp_code, "phone_number": phone_e164, "country": country_iso2},
+            {"code": otp_code, "phone_number": phone_e164, "country_code": dial_code},
+            {"otp": otp_code, "phone": phone_e164},
+        ]
+
+        continue_candidates: List[str] = []
+        last_final_url = gate_url
+        verification_success = False
+
+        for endpoint in candidate_endpoints:
+            for payload in payload_candidates:
+                try:
+                    response = self.session.post(
+                        endpoint,
+                        headers=headers,
+                        data=json.dumps(payload),
+                        allow_redirects=False,
+                        timeout=20,
+                    )
+                    response_json, response_urls, page_type, error_text, body_text = self._collect_response_resume_signals(
+                        response,
+                        endpoint,
+                    )
+                    continue_candidates.extend(response_urls)
+                    if page_type:
+                        self._log(f"短信验证码响应页面类型: {page_type}")
+
+                    has_progress = self._response_has_forward_progress(
+                        response,
+                        response_json=response_json,
+                        continue_candidates=response_urls,
+                        page_type=page_type,
+                        body_text=body_text,
+                    )
+                    signal = "progress" if has_progress else "no-progress"
+                    self._log(f"提交短信验证码尝试: {endpoint} -> {response.status_code} ({signal})")
+
+                    if error_text:
+                        self._log(f"短信验证码接口返回错误: {error_text[:160]}", "warning")
+                        continue
+
+                    if has_progress:
+                        verification_success = True
+                        break
+                except Exception as submit_err:
+                    self._log(f"提交短信验证码失败: {endpoint} -> {submit_err}", "warning")
+                    continue
+            if verification_success:
+                break
+
+        if not verification_success:
+            self._log("短信验证码自动提交未成功", "error")
+            return None, gate_url
+
+        unique_continue_urls: List[str] = []
+        seen_urls: Set[str] = set()
+        for url in continue_candidates:
+            normalized = str(url or "").strip().replace("\\/", "/")
+            if normalized and normalized not in seen_urls:
+                unique_continue_urls.append(normalized)
+                seen_urls.add(normalized)
+
+        if workspace_id:
+            try:
+                select_continue = str(self.workspace_ops.select_workspace(workspace_id) or "").strip()
+                if select_continue and select_continue not in seen_urls:
+                    unique_continue_urls.append(select_continue)
+                    seen_urls.add(select_continue)
+            except Exception:
+                pass
+
+        oauth_start_url = str(
+            (
+                getattr(self.auth_ops.oauth_start, "auth_url", "")
+                or getattr(self.auth_ops.oauth_start, "url", "")
+                if self.auth_ops.oauth_start
+                else ""
+            )
+            or ""
+        ).strip()
+        if oauth_start_url and oauth_start_url not in seen_urls:
+            unique_continue_urls.append(oauth_start_url)
+            seen_urls.add(oauth_start_url)
+
+        if gate_url not in seen_urls:
+            unique_continue_urls.append(gate_url)
+
+        for next_url in unique_continue_urls:
+            callback_url, last_final_url = self.redirect_ops.follow_redirects(next_url)
+            if callback_url:
+                self._log("短信验证码提交后已恢复 OAuth 回调链路")
+                return callback_url, last_final_url
+
+        return None, last_final_url
+
+    def _submit_add_phone_and_resume(self, gate_url: str, workspace_id: str = "") -> Tuple[Optional[str], str]:
+        """尝试提交手机号并继续 OAuth 流程。"""
+        phone_ctx = self._prompt_phone_country_and_number()
+        if not phone_ctx:
+            return None, gate_url
+
+        gate_url = str(gate_url or "").strip() or "https://auth.openai.com/add-phone"
+        country_iso2 = str(phone_ctx.get("country_iso2") or "").strip().upper()
+        dial_code = str(phone_ctx.get("dial_code") or "").strip()
+        phone_e164 = str(phone_ctx.get("phone_e164") or "").strip()
+        national_number = re.sub(r"\D", "", phone_e164.replace(dial_code, "", 1)) if dial_code else re.sub(r"\D", "", phone_e164)
+
+        did = str(self.session.cookies.get("oai-did") or "").strip() if self.session else ""
+        sentinel_token = None
+        if did:
+            for flow in ("oauth_add_phone", "authorize_continue"):
+                try:
+                    sentinel_token = self.http_client.check_sentinel(did, flow=flow)
+                except Exception:
+                    sentinel_token = None
+                if sentinel_token:
+                    break
+
+        headers = {
+            "referer": gate_url,
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": "https://auth.openai.com",
+        }
+        if sentinel_token and did:
+            headers["openai-sentinel-token"] = json.dumps({
+                "p": "",
+                "t": "",
+                "c": sentinel_token,
+                "id": did,
+                "flow": "oauth_add_phone",
+            })
+
+        candidate_endpoints = self._candidate_gate_endpoints(gate_url, mode="phone_submit")
+
+        payload_candidates = [
+            {"phone_number": phone_e164, "country": country_iso2},
+            {"phone_number": national_number, "country": country_iso2, "country_code": dial_code},
+            {"phone_number": phone_e164, "country_code": country_iso2},
+            {"phone": phone_e164, "country": country_iso2},
+            {"phone_number": phone_e164},
+            {"phone": phone_e164},
+        ]
+
+        continue_candidates: List[str] = []
+        last_final_url = gate_url
+        submission_success = False
+
+        for endpoint in candidate_endpoints:
+            for payload in payload_candidates:
+                try:
+                    response = self.session.post(
+                        endpoint,
+                        headers=headers,
+                        data=json.dumps(payload),
+                        allow_redirects=False,
+                        timeout=20,
+                    )
+                    response_json, response_urls, page_type, error_text, body_text = self._collect_response_resume_signals(
+                        response,
+                        endpoint,
+                    )
+                    continue_candidates.extend(response_urls)
+                    if page_type:
+                        self._log(f"提交手机号响应页面类型: {page_type}")
+
+                    has_progress = self._response_has_forward_progress(
+                        response,
+                        response_json=response_json,
+                        continue_candidates=response_urls,
+                        page_type=page_type,
+                        body_text=body_text,
+                    )
+                    signal = "progress" if has_progress else "no-progress"
+                    self._log(f"提交手机号尝试: {endpoint} -> {response.status_code} ({signal})")
+
+                    if error_text:
+                        self._log(f"手机号接口返回错误: {error_text[:160]}", "warning")
+                        continue
+
+                    if has_progress:
+                        submission_success = True
+                        break
+                except Exception as submit_err:
+                    self._log(f"提交手机号失败: {endpoint} -> {submit_err}", "warning")
+                    continue
+            if submission_success:
+                break
+
+        if not submission_success:
+            self._log("自动填写手机号未成功，仍停留在 add-phone 页面", "error")
+            return None, gate_url
+
+        unique_continue_urls: List[str] = []
+        seen_urls: Set[str] = set()
+        for url in continue_candidates:
+            normalized = str(url or "").strip().replace("\\/", "/")
+            if normalized and normalized not in seen_urls:
+                unique_continue_urls.append(normalized)
+                seen_urls.add(normalized)
+
+        if workspace_id:
+            try:
+                select_continue = str(self.workspace_ops.select_workspace(workspace_id) or "").strip()
+                if select_continue and select_continue not in seen_urls:
+                    unique_continue_urls.append(select_continue)
+                    seen_urls.add(select_continue)
+            except Exception:
+                pass
+
+        oauth_start_url = str(
+            (
+                getattr(self.auth_ops.oauth_start, "auth_url", "")
+                or getattr(self.auth_ops.oauth_start, "url", "")
+                if self.auth_ops.oauth_start
+                else ""
+            )
+            or ""
+        ).strip()
+        if oauth_start_url and oauth_start_url not in seen_urls:
+            unique_continue_urls.append(oauth_start_url)
+            seen_urls.add(oauth_start_url)
+
+        if gate_url not in seen_urls:
+            unique_continue_urls.append(gate_url)
+
+        for next_url in unique_continue_urls:
+            callback_url, last_final_url = self.redirect_ops.follow_redirects(next_url)
+            if callback_url:
+                self._log("手机号提交后已恢复 OAuth 回调链路")
+                return callback_url, last_final_url
+
+        lower_final = str(last_final_url or "").strip().lower()
+        if ("/phone-verification" in lower_final) or ("phone-otp" in lower_final) or ("verify-phone" in lower_final):
+            self._log("检测到手机号验证码页面，尝试控制台输入短信验证码继续...", "warning")
+            return self._submit_phone_otp_and_resume(
+                gate_url=last_final_url or gate_url,
+                workspace_id=workspace_id,
+                country_iso2=country_iso2,
+                dial_code=dial_code,
+                phone_e164=phone_e164,
+            )
+
+        return None, last_final_url
 
 
     def run(self) -> RegistrationResult:
@@ -1833,10 +2495,14 @@ class RegistrationEngine:
         
         if not callback_url:
             if _is_registration_gate_url(_final_url):
-                result.error_message = "登录后跳转到添加手机号/完善资料页面，无法继续获取 Token"
-                self._log(f"{result.error_message}: {_final_url}", "error")
-                return result
+                self._log(f"检测到注册门页: {_final_url}，尝试交互填写手机号后继续流程...", "warning")
+                callback_url, _final_url = self._submit_add_phone_and_resume(_final_url, workspace_id=workspace_id)
+                if not callback_url and _is_registration_gate_url(_final_url):
+                    result.error_message = "登录后跳转到添加手机号/完善资料页面，自动填写后仍无法继续获取 Token"
+                    self._log(f"{result.error_message}: {_final_url}", "error")
+                    return result
 
+        if not callback_url:
             self._log("未命中 OAuth 回调，尝试 auth/session 兜底抓取 token...", "warning")
             self.token_ops.capture_auth_session_tokens(result, access_hint=result.access_token)
             if not result.account_id:
