@@ -33,6 +33,8 @@ from lib.clients import CloudMailService
 # 全局文件写入锁
 _file_lock = threading.Lock()
 
+DEFAULT_INPUT_FILE = os.path.join("accounts", "accounts.txt")
+
 def init_cloudmail_client(config):
     cloud_mail_config = {
         "base_url": config.get("cloudmail_url", ""),
@@ -40,13 +42,14 @@ def init_cloudmail_client(config):
         "admin_password": config.get("cloudmail_admin_password", ""),
         "domain": config.get("cloudmail_domains", []),
         "subdomain": config.get("cloudmail_subdomain", ""),
+        "outlook_mail_web_url": config.get("outlook_mail_web_url", ""),
         "timeout": config.get("timeout", 30),
         "proxy_url": config.get("proxy", "")
     }
     return CloudMailService(config=cloud_mail_config)
 
 def parse_account_line(line):
-    """解析账号行，支持 email----password、email,password、email password。"""
+    """解析账号行，支持普通账号与 Outlook 扩展格式。"""
     value = str(line or "").strip().lstrip("\ufeff")
     if not value or value.startswith("#"):
         return None
@@ -65,7 +68,33 @@ def parse_account_line(line):
     password = str(parts[1] or "").strip()
     if not email or not password:
         raise ValueError(f"账号行缺少邮箱或密码: {line.rstrip()}")
-    return email, password
+
+    account = {
+        "email": email,
+        "password": password,
+        "email_password": "",
+        "rt": "",
+        "is_outlook": email.endswith("@outlook.com"),
+        "raw_line": value,
+    }
+
+    if account["is_outlook"]:
+        if "----" not in value:
+            raise ValueError(
+                f"Outlook 账号行格式错误，必须为 账号----密码----邮箱密码----rt: {line.rstrip()}"
+            )
+        if len(parts) < 4:
+            raise ValueError(
+                f"Outlook 账号行缺少字段，必须为 账号----密码----邮箱密码----rt: {line.rstrip()}"
+            )
+        email_password = str(parts[2] or "").strip()
+        rt_value = str(parts[3] or "").strip()
+        if not email_password:
+            raise ValueError(f"Outlook 账号行缺少邮箱密码: {line.rstrip()}")
+        account["email_password"] = email_password
+        account["rt"] = rt_value
+
+    return account
 
 
 def load_account_credentials(input_file):
@@ -176,7 +205,7 @@ def select_accounts(accounts, indexes_text="", emails_text=""):
 
     emails = parse_email_filter(emails_text)
     if emails:
-        account_map = {email: (email, password) for email, password in accounts}
+        account_map = {str(account.get("email") or "").strip().lower(): account for account in accounts}
         missing = [email for email in emails if email not in account_map]
         if missing:
             raise ValueError(f"--emails 中账号不存在于输入文件: {', '.join(missing)}")
@@ -206,7 +235,7 @@ def login_one_account(idx, total, account, cloudmail_client, token_manager, conf
     Args:
         idx: 账号序号
         total: 总账号数
-        account: (email, password)
+        account: 账号字典
         cloudmail_client: CloudMail 客户端
         token_manager: Token 管理器
         config: 配置字典
@@ -215,7 +244,9 @@ def login_one_account(idx, total, account, cloudmail_client, token_manager, conf
         tuple: (success, email, password, message)
     """
     tag = f"[{idx}/{total}]"
-    email, password = account
+    email = str(account.get("email") or "").strip().lower()
+    password = str(account.get("password") or "").strip()
+    email_password = str(account.get("email_password") or "").strip()
     print(f"\n{tag} 开始登录获取 Token: {email}")
     
     try:
@@ -236,7 +267,8 @@ def login_one_account(idx, total, account, cloudmail_client, token_manager, conf
             proxy_url=proxy,
             callback_logger=callback_logger
         )
-        
+        engine.email_auth_password = email_password
+
         # 3. 执行本地账号登录流程
         print(f"{tag} 开始执行本地账号登录流程...")
         result = engine.run_login(email, password)
@@ -306,7 +338,7 @@ def main():
     """主函数"""
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='ChatGPT 批量登录获取 Token 工具 v2.0')
-    parser.add_argument('-i', '--input-file', default="", help='本地账号文件（默认读取配置 input_file 或 accounts.txt）')
+    parser.add_argument('-i', '--input-file', default="", help='本地账号文件（默认读取配置 input_file 或 accounts/accounts.txt）')
     parser.add_argument('-n', '--num', type=int, default=0, help='处理账号数量（默认: 0，表示全部）')
     parser.add_argument('-w', '--workers', type=int, default=1, help='并发线程数（默认: 1）')
     parser.add_argument('--indexes', default="", help='按序号选择账号，支持 1,2,4 / 2-6 / -3 / 3-')
@@ -322,7 +354,7 @@ def main():
     # 加载配置
     config = load_config()
     
-    input_file = args.input_file or config.get("input_file", "accounts.txt")
+    input_file = args.input_file or config.get("input_file", DEFAULT_INPUT_FILE)
     accounts = load_account_credentials(input_file)
     accounts = select_accounts(accounts, indexes_text=args.indexes, emails_text=args.emails)
     if args.num and args.num > 0:

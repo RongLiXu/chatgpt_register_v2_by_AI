@@ -25,3 +25,4 @@ rk.txt
 *.tmp
 sub2api.json
 accounts
+failed_accounts.txt

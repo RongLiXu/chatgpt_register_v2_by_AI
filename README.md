@@ -4,7 +4,7 @@
 
 当前仓库的主入口是 `chatgpt_register_v2.py`，其实际职责是：
 
-- 从 `accounts.txt` 读取账号密码
+- 默认从 `accounts/accounts.txt` 读取账号密码
 - 自动执行 OpenAI 登录
 - 自动从 CloudMail 拉取邮箱验证码
 - 获取 `access_token` / `refresh_token` / `id_token` / `session_token`
@@ -54,7 +54,8 @@
 │   └── __init__.py
 ├── config.example.json      # 配置模板
 ├── config.json              # 本地配置
-├── accounts.txt             # 本地账号文件
+├── accounts/
+│   └── accounts.txt         # 默认本地账号文件
 ├── tokens/                  # 每个账号的 JSON token 文件
 ├── ak.txt                   # access_token 列表
 ├── rk.txt                   # refresh_token 列表
@@ -153,9 +154,10 @@ pip install curl-cffi requests
   "cloudmail_domains": [],
   "cloudmail_subdomain": "",
   "cloudmail_url": "",
+  "outlook_mail_web_url": "https://ms.lqqq.cc/web",
   "timeout": 30,
   "proxy": "http://127.0.0.1:10808",
-  "input_file": "accounts.txt",
+  "input_file": "accounts/accounts.txt",
   "output_file": "registered_accounts.txt",
   "failed_output_file": "failed_accounts.txt",
   "enable_oauth": true,
@@ -181,6 +183,7 @@ pip install curl-cffi requests
 | `cloudmail_admin_password` | CloudMail 管理员密码 |
 | `cloudmail_domains` | 生成邮箱可用域名列表 |
 | `cloudmail_subdomain` | 可选子域名前缀 |
+| `outlook_mail_web_url` | Outlook 邮箱验证码列表页完整前缀地址，程序会自动拼接 `账号----邮箱密码` |
 | `proxy` | 请求代理 |
 | `input_file` | 本地账号文件 |
 | `output_file` | 成功账号输出文件 |
@@ -194,13 +197,28 @@ pip install curl-cffi requests
 
 ## 账号文件格式
 
-`accounts.txt` 每行一个账号，支持三种格式：
+默认账号文件为 `accounts/accounts.txt`。
+
+普通账号每行一个，支持三种格式：
 
 ```text
 email@example.com----password123
 email@example.com,password123
 email@example.com password123
 ```
+
+Outlook 账号单独使用 4 段格式：
+
+```text
+user@outlook.com----openai_password----mailbox_password----rt
+```
+
+字段含义：
+
+- 第 1 段：OpenAI 登录邮箱
+- 第 2 段：OpenAI 登录密码
+- 第 3 段：Outlook 邮箱密码
+- 第 4 段：预留 `rt`
 
 注释行和空行会被忽略。
 
@@ -215,7 +233,7 @@ python3 chatgpt_register_v2.py
 ### 只处理第 5 条账号
 
 ```bash
-python3 chatgpt_register_v2.py -i accounts.txt --indexes 5 -w 1
+python3 chatgpt_register_v2.py -i accounts/accounts.txt --indexes 5 -w 1
 ```
 
 ### 处理多个离散账号
@@ -252,7 +270,7 @@ python3 chatgpt_register_v2.py --indexes 5 --no-oauth
 
 | 参数 | 说明 |
 |---|---|
-| `-i, --input-file` | 指定账号文件，默认读取 `config.input_file` 或 `accounts.txt` |
+| `-i, --input-file` | 指定账号文件，默认读取 `config.input_file` 或 `accounts/accounts.txt` |
 | `-n, --num` | 处理数量上限，`0` 表示全部 |
 | `-w, --workers` | 并发线程数 |
 | `--indexes` | 按序号筛选账号 |

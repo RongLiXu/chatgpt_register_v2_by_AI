@@ -77,6 +77,10 @@ class OTPOperations:
     def session(self):
         """获取主引擎的唯一 session"""
         return self.engine.session
+
+    def _is_outlook_account(self, email: str) -> bool:
+        """判断是否为 Outlook 邮箱。"""
+        return str(email or "").strip().lower().endswith("@outlook.com")
     
     def send_verification_code(self, referer: Optional[str] = None) -> bool:
         """发送验证码"""
@@ -110,13 +114,27 @@ class OTPOperations:
             self._log(f"正在等待邮箱 {email} 的验证码...")
 
             fetch_timeout = int(timeout) if timeout and int(timeout) > 0 else 120
-            code = self.email_service.get_verification_code(
-                email=email,
-                email_id=email_id,
-                timeout=fetch_timeout,
-                pattern=OTP_CODE_PATTERN,
-                otp_sent_at=self._otp_sent_at,
-            )
+            if self._is_outlook_account(email):
+                email_password = str(getattr(self.engine, "email_auth_password", "") or "").strip()
+                outlook_rt = str(getattr(self.engine, "email_refresh_token", "") or "").strip()
+                self._log(f"检测到 Outlook 邮箱，切换到 Outlook 专用验证码获取流程: {email}")
+                code = self.email_service.get_outlook_verification_code(
+                    email=email,
+                    email_password=email_password,
+                    email_id=email_id,
+                    timeout=fetch_timeout,
+                    pattern=OTP_CODE_PATTERN,
+                    otp_sent_at=self._otp_sent_at,
+                    rt=outlook_rt,
+                )
+            else:
+                code = self.email_service.get_verification_code(
+                    email=email,
+                    email_id=email_id,
+                    timeout=fetch_timeout,
+                    pattern=OTP_CODE_PATTERN,
+                    otp_sent_at=self._otp_sent_at,
+                )
 
             if code:
                 self._log(f"成功获取验证码: {code}")
@@ -1394,6 +1412,8 @@ class RegistrationEngine:
         # 状态变量
         self.email: Optional[str] = None
         self.password: Optional[str] = None
+        self.email_auth_password: Optional[str] = None
+        self.email_refresh_token: Optional[str] = None
         self.device_id: Optional[str] = None
         self.session: Optional[object] = None  # 唯一的会话对象
         self.session_token: Optional[str] = None

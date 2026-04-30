@@ -6,6 +6,7 @@ import re
 import time
 import json
 import uuid
+import html
 import base64
 import random
 import string
@@ -527,7 +528,7 @@ class CloudMailService:
             提取的域名，如 ukumbuko.us.ci
         """
 
-        parsed = urlparse(url)
+        parsed = urllib.parse.urlparse(url)
         domain = parsed.netloc or parsed.path.split('/')[0]
         if not domain:
             raise ValueError(f"无法从 URL 提取域名: {url}")
@@ -890,6 +891,210 @@ class CloudMailService:
 
         # 超时
         logger.warning(f"等待验证码超时: {email}")
+        return None
+
+    def get_outlook_verification_code(
+        self,
+        email: str,
+        email_password: str,
+        email_id: str = None,
+        timeout: int = 120,
+        pattern: str = OTP_CODE_PATTERN,
+        otp_sent_at: Optional[float] = None,
+        rt: str = "",
+    ) -> Optional[str]:
+        """
+        从 Outlook 邮箱获取验证码。
+
+        通过配置中的 Outlook Web 邮箱列表前缀地址拼接 账号----邮箱密码 获取邮件列表，
+        选择最新的目标邮件，再进入详情页提取验证码。
+        """
+        if not email or not email_password:
+            raise EmailServiceError("Outlook 邮箱或邮箱密码为空")
+
+        start_time = time.time()
+        list_prefix_url = str(self.config.get("outlook_mail_web_url") or "").strip().rstrip("/")
+        if not list_prefix_url:
+            raise EmailServiceError("未配置 outlook_mail_web_url")
+        base_url = urllib.parse.urlsplit(list_prefix_url)
+        origin = f"{base_url.scheme}://{base_url.netloc}" if base_url.scheme and base_url.netloc else ""
+        if not origin:
+            raise EmailServiceError("outlook_mail_web_url 配置格式无效")
+        mailbox_key = f"{email}----{email_password}"
+        encoded_mailbox_key = urllib.parse.quote(mailbox_key, safe="@-_.~")
+        list_url = f"{list_prefix_url}/{encoded_mailbox_key}"
+
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+        )
+
+        while time.time() - start_time < timeout:
+            try:
+                response = session.get(list_url, timeout=20, verify=False)
+
+                if response.status_code == 404:
+                    raise EmailServiceError(f"Outlook 邮箱不存在或邮箱密码错误: {email}")
+                if response.status_code >= 400:
+                    time.sleep(3)
+                    continue
+
+                entries = self._parse_outlook_email_list(
+                    list_html=response.text,
+                    base_url=origin,
+                    pattern=pattern,
+                    otp_sent_at=otp_sent_at,
+                )
+                if not entries:
+                    time.sleep(3)
+                    continue
+
+                latest_entry = entries[0]
+                subject_code = self._extract_code_from_text(latest_entry.get("subject", ""), pattern)
+                if subject_code:
+                    self.update_status(True)
+                    return subject_code
+
+                detail_url = str(latest_entry.get("detail_url") or "").strip()
+                if not detail_url:
+                    time.sleep(3)
+                    continue
+
+                detail_response = session.get(detail_url, timeout=20, verify=False)
+                if detail_response.status_code >= 400:
+                    time.sleep(3)
+                    continue
+
+                code = self._extract_code_from_outlook_detail(detail_response.text, pattern)
+                if code:
+                    self.update_status(True)
+                    return code
+
+            except EmailServiceError:
+                raise
+            except Exception as e:
+                logger.warning(f"Outlook 验证码查询失败: {e}")
+
+            time.sleep(3)
+
+        logger.warning(f"等待 Outlook 验证码超时: {email}")
+        return None
+
+    def _parse_outlook_email_list(
+        self,
+        list_html: str,
+        base_url: str,
+        pattern: str,
+        otp_sent_at: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """解析 Outlook Web 邮件列表，并按时间倒序返回候选邮件。"""
+        html_text = str(list_html or "")
+        if not html_text:
+            return []
+
+        card_pattern = re.compile(
+            r'<li>\s*<div class="email-card">.*?'
+            r'<div class="email-subject">(.*?)</div>.*?'
+            r'<div class="email-date">(.*?)</div>.*?'
+            r'<a href="([^"]*show_email[^"]+)"',
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        entries: List[Dict[str, Any]] = []
+        min_dt = None
+        if otp_sent_at:
+            try:
+                min_dt = datetime.fromtimestamp(float(otp_sent_at))
+            except Exception:
+                min_dt = None
+
+        for match in card_pattern.finditer(html_text):
+            subject = self._clean_outlook_html_text(match.group(1))
+            date_text = self._clean_outlook_html_text(match.group(2))
+            detail_path = str(match.group(3) or "").strip()
+            detail_url = urllib.parse.urljoin(base_url, detail_path)
+
+            lower_subject = subject.lower()
+            if not any(
+                keyword in lower_subject
+                for keyword in (
+                    "chatgpt",
+                    "openai",
+                    "verification code",
+                    "login code",
+                    "验证码",
+                    "code",
+                )
+            ):
+                continue
+
+            dt = self._parse_outlook_email_datetime(date_text)
+            if min_dt and dt and dt < min_dt:
+                continue
+
+            entries.append(
+                {
+                    "subject": subject,
+                    "date_text": date_text,
+                    "detail_url": detail_url,
+                    "datetime": dt,
+                    "has_code_in_subject": bool(self._extract_code_from_text(subject, pattern)),
+                }
+            )
+
+        entries.sort(
+            key=lambda item: (
+                item.get("datetime") is not None,
+                item.get("datetime") or datetime.min,
+                item.get("has_code_in_subject") is True,
+            ),
+            reverse=True,
+        )
+        return entries
+
+    def _extract_code_from_outlook_detail(self, detail_html: str, pattern: str) -> str:
+        """从 Outlook 邮件详情页提取验证码。"""
+        text = self._clean_outlook_html_text(detail_html)
+        return self._extract_code_from_text(text, pattern)
+
+    def _extract_code_from_text(self, text: str, pattern: str) -> str:
+        """从文本中提取验证码。"""
+        content = str(text or "")
+        if not content:
+            return ""
+
+        match = re.search(pattern, content)
+        if match:
+            return str(match.group(1) or "").strip()
+        return ""
+
+    def _clean_outlook_html_text(self, raw_text: str) -> str:
+        """清理 HTML 文本，转为普通文本。"""
+        text = str(raw_text or "")
+        if not text:
+            return ""
+        text = html.unescape(text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _parse_outlook_email_datetime(self, date_text: str) -> Optional[datetime]:
+        """解析 Outlook Web 列表中的时间字符串。"""
+        value = str(date_text or "").strip()
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
         return None
 
 
